@@ -1,0 +1,326 @@
+"use client";
+
+import { useState, useRef, useEffect } from "react";
+import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { fetchFile, toBlobURL } from "@ffmpeg/util";
+
+// --- Configuration & Constants ---
+const GEMINI_API_KEY = process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
+const DELAY_MS = 2000;
+
+const ASPECT_RATIOS = {
+  "16:9 Standard": { w: 1280, h: 720 },
+  "9:16 Shorts": { w: 720, h: 1280 },
+  "1:1 Square": { w: 1080, h: 1080 },
+};
+
+export default function CreatorDashboard() {
+  // --- State ---
+  const [script, setScript] = useState("");
+  const[aspectRatio, setAspectRatio] = useState<keyof typeof ASPECT_RATIOS>("16:9 Standard");
+  const[styleImage, setStyleImage] = useState<File | null>(null);
+  
+  const[isGenerating, setIsGenerating] = useState(false);
+  const [progressText, setProgressText] = useState("");
+  const[finalVideoUrl, setFinalVideoUrl] = useState<string | null>(null);
+
+  const ffmpegRef = useRef(new FFmpeg());
+
+  // --- Initialize FFmpeg ---
+  useEffect(() => {
+    const load = async () => {
+      const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+      const ffmpeg = ffmpegRef.current;
+      
+      // Listen to FFmpeg logs if debugging is needed
+      ffmpeg.on("log", ({ message }) => console.log("[FFmpeg]", message));
+
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+      });
+    };
+    load();
+  },[]);
+
+  // --- Utilities ---
+  const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
+
+  const getAudioDuration = (blob: Blob): Promise<number> => {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.addEventListener("loadedmetadata", () => {
+        resolve(audio.duration);
+        URL.revokeObjectURL(url);
+      });
+    });
+  };
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve((reader.result as string).split(",")[1]);
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // --- Core Pipeline ---
+  const handleGenerate = async () => {
+    if (!script) return alert("Please enter a script.");
+    setIsGenerating(true);
+    setFinalVideoUrl(null);
+    const ffmpeg = ffmpegRef.current;
+
+    try {
+      // ---------------------------------------------------------
+      // PHASE 1: Analysis (Script -> JSON)
+      // ---------------------------------------------------------
+      setProgressText("Analyzing script and generating scenes...");
+      
+      const prompt = `Break this script into a JSON array of 5-8 second scenes. Schema:[{ "sceneId": number, "text": "spoken text", "imagePrompt": "visual description" }]. Script: "${script}"`;
+      
+      const textRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro-latest:generateContent?key=${GEMINI_API_KEY}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      });
+      const textData = await textRes.json();
+      
+      // Clean and parse JSON from Markdown block if present
+      const rawText = textData.candidates[0].content.parts[0].text;
+      const jsonString = rawText.replace(/```json\n?|\n?```/g, "").trim();
+      const scenes = JSON.parse(jsonString);
+
+      const dims = ASPECT_RATIOS[aspectRatio];
+      let styleBase64 = styleImage ? await fileToBase64(styleImage) : null;
+
+      // ---------------------------------------------------------
+      // PHASE 2 & 3: Asset Generation & FFmpeg Processing Loop
+      // ---------------------------------------------------------
+      const chunkFiles: string[] =[];
+      const cleanupBlobs: string[] =[];
+
+      for (let i = 0; i < scenes.length; i++) {
+        const scene = scenes[i];
+        setProgressText(`Generating Assets for Scene ${i + 1}/${scenes.length}...`);
+
+        // 1. Audio Generation (Using Google Translate Free TTS Endpoint as $0 substitute)
+        const audioUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q=${encodeURIComponent(scene.text)}`;
+        const audioRes = await fetch(audioUrl);
+        const audioBlob = await audioRes.blob();
+        const duration = await getAudioDuration(audioBlob);
+
+        // 2. Image Generation (Gemini 3 Flash Image Model mock structure)
+        await delay(DELAY_MS); // Rate limit protection
+        
+        const imagePrompt = `Generate a ${aspectRatio} image. ${scene.imagePrompt}. Ensure consistency with the provided style reference if applicable.`;
+        
+        // Note: Replace endpoint with actual Gemini 3 Flash Image API endpoint when public
+        const imgRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key=${GEMINI_API_KEY}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents:[{
+              parts: [
+                { text: imagePrompt },
+                ...(styleBase64 ?[{ inlineData: { mimeType: "image/jpeg", data: styleBase64 } }] :[])
+              ]
+            }]
+          }),
+        });
+        
+        // Mocking Blob response extraction (assuming Base64 return from future image model)
+        // For actual production, parse the base64 or download the URL returned by the API
+        const imgBlob = new Blob(["mock_image_data"], { type: 'image/jpeg' }); // Mocked for safety
+
+        // Write files to FFmpeg in-memory WASM system
+        const audioFileName = `audio_${i}.mp3`;
+        const imageFileName = `img_${i}.jpg`;
+        const outputChunk = `chunk_${i}.mp4`;
+
+        await ffmpeg.writeFile(audioFileName, await fetchFile(audioBlob));
+        await ffmpeg.writeFile(imageFileName, await fetchFile(imgBlob));
+
+        setProgressText(`Rendering Scene ${i + 1}/${scenes.length} (Ken Burns Effect)...`);
+
+        // Randomize Ken Burns Effect
+        const effects =[
+          `zoompan=z='min(zoom+0.0015,1.5)':d=25*${duration}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${dims.w}x${dims.h}`, // Zoom In
+          `zoompan=z='max(1.5-0.0015*in,1)':d=25*${duration}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${dims.w}x${dims.h}`, // Zoom Out
+          `zoompan=z=1.2:d=25*${duration}:x='x+1':y='ih/2-(ih/zoom/2)':s=${dims.w}x${dims.h}`, // Pan Right
+          `zoompan=z=1.2:d=25*${duration}:x='x-1':y='ih/2-(ih/zoom/2)':s=${dims.w}x${dims.h}`  // Pan Left
+        ];
+        const selectedEffect = effects[Math.floor(Math.random() * effects.length)];
+
+        // Execute FFmpeg to combine Image + Audio with Filter
+        await ffmpeg.exec([
+          "-loop", "1",
+          "-i", imageFileName,
+          "-i", audioFileName,
+          "-vf", `format=yuv420p,${selectedEffect}`,
+          "-c:v", "libx264",
+          "-c:a", "aac",
+          "-b:a", "192k",
+          "-pix_fmt", "yuv420p",
+          "-t", duration.toString(),
+          "-shortest",
+          outputChunk,
+        ]);
+
+        chunkFiles.push(`file '${outputChunk}'`);
+        
+        // Cleanup intermediate files inside FFmpeg to prevent WASM Memory Leaks
+        await ffmpeg.deleteFile(audioFileName);
+        await ffmpeg.deleteFile(imageFileName);
+      }
+
+      // ---------------------------------------------------------
+      // PHASE 4: Output (Concatenation)
+      // ---------------------------------------------------------
+      setProgressText("Merging final video...");
+      
+      await ffmpeg.writeFile("concat.txt", chunkFiles.join("\n"));
+      await ffmpeg.exec([
+        "-f", "concat",
+        "-safe", "0",
+        "-i", "concat.txt",
+        "-c", "copy",
+        "final.mp4"
+      ]);
+
+      // Extract Final Video
+      const finalFileData = await ffmpeg.readFile("final.mp4");
+      const finalBlob = new Blob([finalFileData], { type: "video/mp4" });
+      const finalUrl = URL.createObjectURL(finalBlob);
+      
+      setFinalVideoUrl(finalUrl);
+      setProgressText("Complete!");
+
+      // Cleanup remaining WASM files
+      await ffmpeg.deleteFile("concat.txt");
+      chunkFiles.forEach(async (chunk, i) => {
+        await ffmpeg.deleteFile(`chunk_${i}.mp4`);
+      });
+
+    } catch (error) {
+      console.error(error);
+      setProgressText("Error generating video. Check console.");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  // --- UI Render ---
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 p-8 font-sans selection:bg-indigo-500/30">
+      <div className="max-w-4xl mx-auto space-y-8">
+        
+        {/* Header */}
+        <div>
+          <h1 className="text-4xl font-bold bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">
+            Faceless Creator Studio
+          </h1>
+          <p className="text-slate-400 mt-2">Generate cinematic videos purely in your browser ($0 Server Cost).</p>
+        </div>
+
+        {/* Dashboard Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+          
+          {/* Controls Column */}
+          <div className="space-y-6 bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-xl">
+            
+            <div className="space-y-2">
+              <label className="text-sm font-semibold text-slate-300">Script (300-500 words)</label>
+              <textarea
+                value={script}
+                onChange={(e) => setScript(e.target.value)}
+                className="w-full h-40 bg-slate-950 border border-slate-800 rounded-xl p-4 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none resize-none"
+                placeholder="In the heart of the ancient forest..."
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-semibold text-slate-300">Aspect Ratio</label>
+              <select
+                value={aspectRatio}
+                onChange={(e) => setAspectRatio(e.target.value as keyof typeof ASPECT_RATIOS)}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+              >
+                {Object.keys(ASPECT_RATIOS).map((ratio) => (
+                  <option key={ratio} value={ratio}>{ratio}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm font-semibold text-slate-300">
+                Upload Style Reference <span className="text-slate-500 font-normal">(Consistency)</span>
+              </label>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => setStyleImage(e.target.files?.[0] || null)}
+                className="w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-indigo-500/10 file:text-indigo-400 hover:file:bg-indigo-500/20 cursor-pointer"
+              />
+            </div>
+
+            <button
+              onClick={handleGenerate}
+              disabled={isGenerating}
+              className={`w-full py-4 rounded-xl font-bold transition-all ${
+                isGenerating
+                  ? "bg-slate-800 text-slate-500 cursor-not-allowed"
+                  : "bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/25 active:scale-[0.98]"
+              }`}
+            >
+              {isGenerating ? "Processing..." : "Generate Video"}
+            </button>
+            
+            {/* Progress Bar */}
+            {isGenerating && (
+              <div className="pt-4 animate-pulse">
+                <div className="flex justify-between text-xs text-indigo-400 mb-2">
+                  <span>Status</span>
+                  <span className="font-mono">{progressText}</span>
+                </div>
+                <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                  <div className="bg-indigo-500 h-full w-full animate-[shimmer_2s_infinite] origin-left scale-x-50"></div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Output Column */}
+          <div className="bg-slate-900 p-6 rounded-2xl border border-slate-800 shadow-xl flex flex-col items-center justify-center min-h-[400px]">
+            {finalVideoUrl ? (
+              <div className="w-full space-y-4 flex flex-col items-center">
+                <video
+                  src={finalVideoUrl}
+                  controls
+                  autoPlay
+                  className="w-full max-h-[500px] rounded-lg shadow-2xl border border-slate-700 bg-black"
+                />
+                <a
+                  href={finalVideoUrl}
+                  download="faceless_creation.mp4"
+                  className="px-6 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-full font-bold shadow-lg shadow-emerald-500/20 transition-all active:scale-95"
+                >
+                  ↓ Download MP4
+                </a>
+              </div>
+            ) : (
+              <div className="text-slate-600 flex flex-col items-center space-y-4">
+                <svg className="w-16 h-16 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                <p className="text-sm font-medium">Output will appear here</p>
+              </div>
+            )}
+          </div>
+          
+        </div>
+      </div>
+    </div>
+  );
+}
